@@ -999,8 +999,46 @@ impl Daemon {
             let _ = h.task.await;
         }
         self.stop_streaming_drain_pump();
+
+        // LOCAL PATCH (not upstream): run post_process once, against the whole
+        // finalized transcript, purely for its side effects.
+        //
+        // Upstream deliberately bypasses post_process while streaming (see
+        // `commit_segment` in src/output/streaming.rs): the hook's contract is
+        // text-in/text-out, a per-segment call would transform only the tail
+        // rather than the cumulative transcript, and by the time a segment
+        // finalizes it has already been typed at the cursor — so a returned
+        // transformation could not be applied without erasing and retyping.
+        // "Users who rely on post_process should disable streaming for now."
+        //
+        // That reasoning holds for transform hooks (its original purpose was
+        // LLM cleanup). It does not hold for an *observer* hook, which is what
+        // this machine uses it as: voxtype-focus-guard.sh `filter` mirrors the
+        // text to the clipboard, appends it to transcriptions.log, and echoes
+        // stdin back unchanged. Calling it once here with the complete text and
+        // discarding the result restores both, and cannot affect what was typed
+        // because output already happened.
+        //
+        // Captured before the session is dropped, since finalized_text() lives
+        // on it. Errors are already swallowed by PostProcessor (it falls back to
+        // the input string), so a failing hook cannot break a dictation.
+        let streamed_text = streaming_session
+            .as_ref()
+            .map(|s| s.finalized_text().to_string())
+            .unwrap_or_default();
+
         *streaming_session = None;
         *streaming_chain = None;
+
+        if !streamed_text.trim().is_empty() {
+            if let Some(ref post_processor) = self.post_processor {
+                tracing::info!(
+                    "Streaming: running post_process as observer ({} chars)",
+                    streamed_text.chars().count()
+                );
+                let _ = post_processor.process(&streamed_text).await;
+            }
+        }
 
         self.play_feedback(SoundEvent::TranscriptionComplete);
 
