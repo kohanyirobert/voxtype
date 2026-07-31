@@ -1062,6 +1062,11 @@ pub struct Daemon {
     /// streaming session is draining server-side after the mic stopped.
     /// Aborted in `end_streaming`.
     streaming_drain_pump: Option<tokio::task::JoinHandle<()>>,
+    /// LOCAL PATCH: text a streaming session had typed at the moment a user stop
+    /// disowned it, captured there because `end_streaming` runs later with the
+    /// session already gone. Consumed by the post_process observer; see
+    /// `end_streaming`.
+    disowned_stream_text: Option<String>,
     /// OSD child supervisor task. Holds the JoinHandle so dropping it (on
     /// daemon shutdown) kill_on_drop's the spawned voxtype-osd process.
     osd_supervisor_task: Option<tokio::task::JoinHandle<()>>,
@@ -1219,6 +1224,7 @@ impl Daemon {
             silence_tracker: None,
             is_external_trigger: false,
             streaming_drain_pump: None,
+            disowned_stream_text: None,
             osd_supervisor_task: None,
             model_manager: None,
             model_load_task: None,
@@ -1588,6 +1594,10 @@ impl Daemon {
 
         *audio_capture = Some(capture);
         *streaming_handle = Some(handle);
+        // LOCAL PATCH: a stash left behind by a session whose `Ended` never
+        // arrived belongs to a finished dictation, and must not be mirrored as
+        // if it were this one's.
+        self.disowned_stream_text = None;
         *streaming_session = Some(StreamingSession::new());
         *streaming_chain = Some(output::create_output_chain(&self.config.output));
         *state = State::Streaming {
@@ -1691,6 +1701,13 @@ impl Daemon {
             }
             self.stop_streaming_capture(audio_capture).await;
             if !file_output {
+                // LOCAL PATCH: keep what this session put at the cursor,
+                // for the post_process observer in `end_streaming` — it
+                // runs off the backend's `Ended` event, by which point
+                // the session dropped just below is long gone.
+                self.disowned_stream_text = streaming_session
+                    .as_ref()
+                    .map(|s| format!("{}{}", s.finalized_text(), s.partial()));
                 // Drop the typing surface synchronously so any
                 // Final/Partial events the backend emits while
                 // draining its internal buffer reach the event-pump
@@ -1905,12 +1922,42 @@ impl Daemon {
         // discarding the result restores both, and cannot affect what was typed
         // because output already happened.
         //
-        // Captured before the session is dropped, since finalized_text() lives
-        // on it. Errors are already swallowed by PostProcessor (it falls back to
-        // the input string), so a failing hook cannot break a dictation.
-        let streamed_text = streaming_session
-            .as_ref()
-            .map(|s| s.finalized_text().to_string())
+        // Errors are already swallowed by PostProcessor (it falls back to the
+        // input string), so a failing hook cannot break a dictation.
+        //
+        // Two sources, because the session is usually *already gone* by the time
+        // this runs. Every user-initiated stop — SIGUSR2 (`voxtype record
+        // toggle`, which is how the niri bind stops a dictation) and push-to-talk
+        // release — sets `streaming_session = None` up front, deliberately, so
+        // the finals the backend drains after `{"type":"finalize"}` reach the
+        // event pump with no session and are discarded instead of typed into
+        // whatever has focus by then. `end_streaming` only runs later, off the
+        // backend's `Ended` event. Reading the session alone therefore narrowed
+        // this hook to the one path that leaves it standing, the 60s recording
+        // cap: measured over one day, 18 timeouts produced 16 observer runs and
+        // 249 manual stops produced none, so only dictations long enough to hit
+        // the cap were ever mirrored to the clipboard.
+        //
+        // `disowned_stream_text` is that missing case — captured at the disown
+        // site itself, while the session is still alive (see the SIGUSR2 and
+        // push-to-talk arms). Prefer it: when it is set the session is gone by
+        // construction.
+        //
+        // Both sources are `finalized_text + partial`, which is exactly what sits
+        // at the cursor: `commit_segment` folds the typed partial tail into
+        // `finalized_text` and clears `partial`, so the two never overlap, and a
+        // dictation with no natural pause has everything still in `partial` —
+        // reading only `finalized_text` would mirror an empty string for it.
+        // Trailing finals dropped by the disown are absent here too, so the
+        // clipboard cannot promise text the window never received.
+        let streamed_text = self
+            .disowned_stream_text
+            .take()
+            .or_else(|| {
+                streaming_session
+                    .as_ref()
+                    .map(|s| format!("{}{}", s.finalized_text(), s.partial()))
+            })
             .unwrap_or_default();
 
         *streaming_session = None;
@@ -2089,6 +2136,10 @@ impl Daemon {
             }
         }
         self.stop_streaming_drain_pump();
+        // LOCAL PATCH: a cancel rewinds what was typed, so there is nothing left
+        // to mirror — drop any stash a preceding stop had captured rather than
+        // letting it reach the observer.
+        self.disowned_stream_text = None;
         *streaming_session = None;
         *streaming_chain = None;
 
@@ -4196,6 +4247,11 @@ impl Daemon {
                             if state.is_streaming() {
                                 tracing::debug!("Streaming push-to-talk released; closing audio capture and disowning session");
                                 self.stop_streaming_capture(&mut audio_capture).await;
+                                // LOCAL PATCH: same capture as the SIGUSR2 arm —
+                                // see there, and `end_streaming`.
+                                self.disowned_stream_text = streaming_session
+                                    .as_ref()
+                                    .map(|s| format!("{}{}", s.finalized_text(), s.partial()));
                                 // Drop session/chain so the backend's
                                 // post-stop flush emission is dropped at
                                 // the event pump instead of typed.
