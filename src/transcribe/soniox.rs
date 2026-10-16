@@ -1,6 +1,7 @@
 //! Soniox cloud streaming WebSocket STT backend.
 //!
-//! Connects to `wss://stt-rt.soniox.com/transcribe-websocket` and pipes
+//! Connects to `wss://stt-rt.soniox.com/transcribe-websocket` (or the
+//! `[soniox] region`'s host, e.g. `stt-rt.eu.soniox.com`) and pipes
 //! 16 kHz mono `pcm_s16le` audio frames over WebSocket, receiving JSON
 //! token messages with per-token `is_final` flags. Implements both:
 //!
@@ -58,13 +59,30 @@ use tokio_tungstenite::tungstenite::Message;
 const SAMPLE_RATE: u32 = 16_000;
 const AUDIO_FORMAT: &str = "pcm_s16le";
 
-/// Production WebSocket endpoint. Soniox doesn't offer regional alternates;
-/// the only realistic override would be a local mock during testing, which
-/// the tests construct directly without touching this constant.
-const SONIOX_WS_ENDPOINT: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
+/// Host label for a data-residency region: US is the bare `soniox.com`, the
+/// others are `<region>.soniox.com`. See https://soniox.com/docs/stt/data-residency.
+fn region_domain(region: Option<&str>) -> Result<&'static str, TranscribeError> {
+    match region.map(|r| r.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("us") => Ok("soniox.com"),
+        Some("eu") => Ok("eu.soniox.com"),
+        Some("jp") => Ok("jp.soniox.com"),
+        Some("in") => Ok("in.soniox.com"),
+        Some(other) => Err(TranscribeError::ConfigError(format!(
+            "Soniox region '{}' unknown: use us, eu, jp or in",
+            other
+        ))),
+    }
+}
 
-/// Base URL for the Soniox async transcription REST API.
-const SONIOX_ASYNC_BASE: &str = "https://api.soniox.com/v1";
+/// Realtime WebSocket endpoint for a region.
+fn ws_endpoint(domain: &str) -> String {
+    format!("wss://stt-rt.{}/transcribe-websocket", domain)
+}
+
+/// Base URL of the async transcription REST API for a region.
+fn async_base(domain: &str) -> String {
+    format!("https://api.{}/v1", domain)
+}
 
 /// WS connect / batch-request timeout. Fixed because the only failure
 /// mode it covers (connect or one-shot request stalls) is a flat network
@@ -86,6 +104,10 @@ const FINALIZE_FRAME: &str = r#"{"type":"finalize"}"#;
 pub struct SonioxTranscriber {
     config: SonioxConfig,
     api_key: String,
+    /// Regional endpoints, resolved from `config.region` once at construction
+    /// so an unknown region fails at startup rather than on first dictation.
+    ws_endpoint: String,
+    async_base: String,
     /// Merged vocabulary-boost terms from `config.terms` + `config.terms_file`.
     /// Loaded once at construction so we don't hit disk per session.
     context_terms: Vec<String>,
@@ -159,10 +181,12 @@ impl SonioxTranscriber {
         }
 
         let context_terms = load_context_terms(&config)?;
+        let domain = region_domain(config.region.as_deref())?;
 
         if config.async_api {
             tracing::info!(
-                "Soniox backend configured: mode=async, model={}, language_hints={:?} (strict={}), context_terms={}",
+                "Soniox backend configured: mode=async, host={}, model={}, language_hints={:?} (strict={}), context_terms={}",
+                domain,
                 config.model,
                 config.language_hints,
                 config.language_hints_strict,
@@ -170,7 +194,8 @@ impl SonioxTranscriber {
             );
         } else {
             tracing::info!(
-                "Soniox backend configured: mode=realtime, model={}, streaming={}, language_hints={:?} (strict={}), context_terms={}",
+                "Soniox backend configured: mode=realtime, host={}, model={}, streaming={}, language_hints={:?} (strict={}), context_terms={}",
+                domain,
                 config.model,
                 config.streaming,
                 config.language_hints,
@@ -181,6 +206,8 @@ impl SonioxTranscriber {
         Ok(Self {
             config,
             api_key,
+            ws_endpoint: ws_endpoint(domain),
+            async_base: async_base(domain),
             context_terms,
             async_client: std::sync::OnceLock::new(),
         })
@@ -528,7 +555,7 @@ impl SonioxTranscriber {
     async fn batch_transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError> {
         let (ws_stream, _) = tokio::time::timeout(
             SONIOX_TIMEOUT,
-            tokio_tungstenite::connect_async(SONIOX_WS_ENDPOINT),
+            tokio_tungstenite::connect_async(self.ws_endpoint.as_str()),
         )
         .await
         .map_err(|_| TranscribeError::InferenceFailed("Soniox: connect timeout".into()))?
@@ -707,7 +734,7 @@ impl SonioxTranscriber {
             .map_err(|e| TranscribeError::InferenceFailed(format!("mime build failed: {}", e)))?;
         let form = reqwest::multipart::Form::new().part("file", file_part);
         let resp = client
-            .post(format!("{}/files", SONIOX_ASYNC_BASE))
+            .post(format!("{}/files", self.async_base))
             .header("Authorization", &auth)
             .multipart(form)
             .send()
@@ -770,7 +797,7 @@ impl SonioxTranscriber {
             body["context"] = serde_json::Value::Object(ctx_obj);
         }
         let resp = client
-            .post(format!("{}/transcriptions", SONIOX_ASYNC_BASE))
+            .post(format!("{}/transcriptions", self.async_base))
             .header("Authorization", &auth)
             .header("Content-Type", "application/json")
             .body(body.to_string())
@@ -813,7 +840,7 @@ impl SonioxTranscriber {
             }
             tokio::time::sleep(poll_interval).await;
             let resp = client
-                .get(format!("{}/transcriptions/{}", SONIOX_ASYNC_BASE, job_id))
+                .get(format!("{}/transcriptions/{}", self.async_base, job_id))
                 .header("Authorization", &auth)
                 .send()
                 .await
@@ -867,7 +894,7 @@ impl SonioxTranscriber {
         let resp = client
             .get(format!(
                 "{}/transcriptions/{}/transcript",
-                SONIOX_ASYNC_BASE, job_id
+                self.async_base, job_id
             ))
             .header("Authorization", &auth)
             .send()
@@ -911,7 +938,7 @@ impl SonioxTranscriber {
 
     async fn async_delete_file(&self, client: &reqwest::Client, auth: &str, file_id: &str) {
         let _ = client
-            .delete(format!("{}/files/{}", SONIOX_ASYNC_BASE, file_id))
+            .delete(format!("{}/files/{}", self.async_base, file_id))
             .header("Authorization", auth)
             .send()
             .await;
@@ -921,7 +948,7 @@ impl SonioxTranscriber {
         // DELETE /v1/transcriptions/{id} cascades to its associated file
         // per Soniox docs, so we don't issue a separate /files/{id} DELETE.
         let _ = client
-            .delete(format!("{}/transcriptions/{}", SONIOX_ASYNC_BASE, job_id))
+            .delete(format!("{}/transcriptions/{}", self.async_base, job_id))
             .header("Authorization", auth)
             .send()
             .await;
@@ -938,9 +965,11 @@ impl StreamingTranscriber for SonioxTranscriber {
 
         let init = self.init_frame();
         let type_partials = self.config.type_partials;
+        let endpoint = self.ws_endpoint.clone();
 
         let task = tokio::spawn(async move {
-            run_streaming_session(init, type_partials, samples_rx, events_tx, cancel_rx).await
+            run_streaming_session(endpoint, init, type_partials, samples_rx, events_tx, cancel_rx)
+                .await
         });
 
         Ok(StreamHandle {
@@ -962,6 +991,7 @@ async fn send_fatal(events_tx: &mpsc::Sender<StreamingEvent>, msg: String) {
 }
 
 async fn run_streaming_session(
+    endpoint: String,
     init_frame: String,
     type_partials: bool,
     mut samples_rx: mpsc::Receiver<Vec<f32>>,
@@ -971,7 +1001,7 @@ async fn run_streaming_session(
     // Connect.
     let ws_result = tokio::time::timeout(
         SONIOX_TIMEOUT,
-        tokio_tungstenite::connect_async(SONIOX_WS_ENDPOINT),
+        tokio_tungstenite::connect_async(endpoint.as_str()),
     )
     .await;
     let ws_stream = match ws_result {
@@ -1157,6 +1187,7 @@ mod tests {
     fn cfg_with_key(key: Option<&str>) -> SonioxConfig {
         SonioxConfig {
             api_key: key.map(|s| s.to_string()),
+            region: None,
             model: "stt-rt-v4".into(),
             language_hints: vec!["hu".into(), "en".into()],
             language_hints_strict: true,
@@ -1168,6 +1199,27 @@ mod tests {
             async_api: false,
             async_max_wait_secs: 120,
         }
+    }
+
+    #[test]
+    fn region_selects_regional_hosts() {
+        let d = region_domain(None).unwrap();
+        assert_eq!(ws_endpoint(d), "wss://stt-rt.soniox.com/transcribe-websocket");
+        assert_eq!(async_base(d), "https://api.soniox.com/v1");
+        assert_eq!(region_domain(Some("us")).unwrap(), "soniox.com");
+        let eu = region_domain(Some(" EU ")).unwrap();
+        assert_eq!(ws_endpoint(eu), "wss://stt-rt.eu.soniox.com/transcribe-websocket");
+        assert_eq!(async_base(eu), "https://api.eu.soniox.com/v1");
+        assert_eq!(region_domain(Some("jp")).unwrap(), "jp.soniox.com");
+        assert_eq!(region_domain(Some("in")).unwrap(), "in.soniox.com");
+        assert!(region_domain(Some("mars")).is_err());
+    }
+
+    #[test]
+    fn unknown_region_fails_at_construction() {
+        let mut cfg = cfg_with_key(Some("k"));
+        cfg.region = Some("mars".into());
+        assert!(SonioxTranscriber::new(cfg).is_err());
     }
 
     #[test]

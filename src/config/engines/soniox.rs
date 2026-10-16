@@ -14,6 +14,13 @@ pub struct SonioxConfig {
     #[serde(default)]
     pub api_key: Option<String>,
 
+    /// Data-residency region: "us" (default), "eu", "jp" or "in". Picks the
+    /// regional API hosts (`stt-rt.<region>.soniox.com`, `api.<region>...`).
+    /// API keys belong to a region's project and are rejected (401) by the
+    /// other regions' hosts. See https://soniox.com/docs/stt/data-residency.
+    #[serde(default)]
+    pub region: Option<String>,
+
     /// Soniox model name. Default: "stt-rt-v4".
     #[serde(default = "default_soniox_model")]
     pub model: String,
@@ -93,6 +100,7 @@ impl Default for SonioxConfig {
     fn default() -> Self {
         Self {
             api_key: None,
+            region: None,
             model: default_soniox_model(),
             language_hints: default_soniox_language_hints(),
             language_hints_strict: true,
