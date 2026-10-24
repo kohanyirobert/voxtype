@@ -1086,8 +1086,15 @@ impl StreamingTranscriber for SonioxTranscriber {
         let endpoint = self.ws_endpoint.clone();
 
         let task = tokio::spawn(async move {
-            run_streaming_session(endpoint, init, type_partials, samples_rx, events_tx, cancel_rx)
-                .await
+            run_streaming_session(
+                endpoint,
+                init,
+                type_partials,
+                samples_rx,
+                events_tx,
+                cancel_rx,
+            )
+            .await
         });
 
         Ok(StreamHandle {
@@ -1328,11 +1335,17 @@ mod tests {
     #[test]
     fn region_selects_regional_hosts() {
         let d = region_domain(None).unwrap();
-        assert_eq!(ws_endpoint(d), "wss://stt-rt.soniox.com/transcribe-websocket");
+        assert_eq!(
+            ws_endpoint(d),
+            "wss://stt-rt.soniox.com/transcribe-websocket"
+        );
         assert_eq!(async_base(d), "https://api.soniox.com/v1");
         assert_eq!(region_domain(Some("us")).unwrap(), "soniox.com");
         let eu = region_domain(Some(" EU ")).unwrap();
-        assert_eq!(ws_endpoint(eu), "wss://stt-rt.eu.soniox.com/transcribe-websocket");
+        assert_eq!(
+            ws_endpoint(eu),
+            "wss://stt-rt.eu.soniox.com/transcribe-websocket"
+        );
         assert_eq!(async_base(eu), "https://api.eu.soniox.com/v1");
         assert_eq!(region_domain(Some("jp")).unwrap(), "jp.soniox.com");
         assert_eq!(region_domain(Some("in")).unwrap(), "in.soniox.com");

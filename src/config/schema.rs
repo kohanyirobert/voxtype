@@ -325,6 +325,7 @@ pub const REPLACEMENTS_TABLE: &str = "text.replacements";
 
 const FILE_MODE_CHOICES: &[&str] = &["overwrite", "append"];
 const URGENCY_CHOICES: &[&str] = &["low", "normal", "critical"];
+const SONIOX_REGION_CHOICES: &[&str] = &["us", "eu", "jp", "in"];
 const PASTE_KEY_CHOICES: &[&str] = &["auto", "shift+insert", "ctrl+v", "ctrl+shift+v", "super+v"];
 const STATE_FILE_CHOICES: &[&str] = &["auto", "disabled"];
 const MEETING_STORAGE_CHOICES: &[&str] = &["auto"];
@@ -936,6 +937,16 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Engine",
         "API key",
         "Soniox API key. Unset falls back to the SONIOX_API_KEY environment variable.",
+    )
+    .for_engine("soniox"),
+    spec(
+        "soniox.region",
+        "soniox",
+        "region",
+        closed(SONIOX_REGION_CHOICES),
+        "Engine",
+        "Region",
+        "Data-residency region. API keys only work on their own region's hosts. Unset means us.",
     )
     .for_engine("soniox"),
     spec(
@@ -3322,6 +3333,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "openvino.streaming" => json!(ov().streaming),
 
         "soniox.api_key" => opt_str(so().api_key.as_ref()),
+        "soniox.region" => opt_str(so().region.as_ref()),
         "soniox.model" => json!(so().model),
         "soniox.language_hints_strict" => json!(so().language_hints_strict),
         "soniox.streaming" => json!(so().streaming),
