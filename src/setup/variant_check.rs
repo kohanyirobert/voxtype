@@ -64,6 +64,9 @@ pub enum Remediation {
 pub fn required_feature(engine: TranscriptionEngine) -> Option<&'static str> {
     match engine {
         TranscriptionEngine::Whisper => None,
+        // LOCAL PATCH: Soniox is compiled unconditionally since #567, so there
+        // is no `soniox` feature to find and the check would always misfire.
+        TranscriptionEngine::Soniox => None,
         other => Some(other.name()),
     }
 }
@@ -234,7 +237,6 @@ mod tests {
             TranscriptionEngine::Dolphin,
             TranscriptionEngine::Omnilingual,
             TranscriptionEngine::Cohere,
-            TranscriptionEngine::Soniox,
         ];
         for e in engines {
             assert!(
